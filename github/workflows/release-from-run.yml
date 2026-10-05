@@ -1,0 +1,55 @@
+name: Release From Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Run ID of the completed Build Kernels run to publish from'
+        required: true
+        type: string
+      release_type:
+        description: 'Release Type'
+        type: choice
+        options:
+          - Pre-Release
+          - Release
+        default: Pre-Release
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-from-run
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Deliberately independent of the build jobs. The artifacts already exist
+    # in the source run, so there is nothing to wait for - and a `needs:` on
+    # any build job would make this unreachable outside a full 7-family
+    # dispatch, which is the case this exists to avoid.
+    steps:
+      - name: Free Disk Space
+        uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/share/julia /usr/local/share/aws-cli /usr/local/share/aws-sam-cli /usr/share/gradle"
+          rm_cmd: "rmz"
+          rmz_version: "3.1.1"
+          testing: false
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Publish release from source run
+        uses: ./.github/actions/release-from-run
+        with:
+          source_run_id: ${{ inputs.source_run_id }}
+          release_type: ${{ inputs.release_type }}

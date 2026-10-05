@@ -1,0 +1,321 @@
+name: 'Release From Existing Run'
+description: 'Build a release from the artifacts of a previous Build Kernels run, without rebuilding'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve source run
+      id: src
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      run: |
+        set -euo pipefail
+
+        if [[ ! "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]; then
+          echo "ERROR: source_run_id must be a numeric run id, got: '$SOURCE_RUN_ID'" >&2
+          exit 1
+        fi
+
+        meta=$(gh api "repos/${{ github.repository }}/actions/runs/${SOURCE_RUN_ID}")
+        status=$(jq -r '.status' <<<"$meta")
+        conclusion=$(jq -r '.conclusion' <<<"$meta")
+        head_branch=$(jq -r '.head_branch' <<<"$meta")
+
+        if [[ "$status" != "completed" ]]; then
+          echo "ERROR: run ${SOURCE_RUN_ID} is still '$status'; wait for it to finish" >&2
+          exit 1
+        fi
+
+        # A non-success conclusion is allowed but reported loudly. The common
+        # case this workflow exists for is a run whose build jobs all passed
+        # and whose release job failed on its own bug - the artifacts are
+        # complete and publishable even though the run is red. What actually
+        # disqualifies a run is missing artifacts, which the download steps
+        # below verify individually.
+        if [[ "$conclusion" != "success" ]]; then
+          echo "WARNING: source run ${SOURCE_RUN_ID} concluded '$conclusion', not 'success'." >&2
+          echo "         Proceeding - the per-artifact checks below will fail if" >&2
+          echo "         anything is actually missing. Verify this is a" >&2
+          echo "         release-step failure, not a build failure, before trusting it." >&2
+        fi
+
+        echo "Source run: ${SOURCE_RUN_ID} (${head_branch}, ${conclusion})"
+        echo "run_id=${SOURCE_RUN_ID}" >> "$GITHUB_OUTPUT"
+        echo "head_branch=${head_branch}" >> "$GITHUB_OUTPUT"
+
+    - name: Download all AnyKernel3 artifacts from source run
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SOURCE_RUN_ID: ${{ steps.src.outputs.run_id }}
+      run: |
+        set -euo pipefail
+        mkdir -p release-assets
+
+        # Page explicitly instead of --paginate: --paginate has been observed
+        # to stop early on runs carrying >1000 artifacts (1129 of 1229 on run
+        # 36828639322), which silently undercounts the target.
+        names=$(mktemp)
+        for page in $(seq 1 50); do
+          batch=$(gh api "repos/${{ github.repository }}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100&page=${page}" \
+            --jq '.artifacts[].name' || true)
+          [ -z "$batch" ] && break
+          printf '%s\n' "$batch" >> "$names"
+          count=$(grep -c . <<<"$batch" || true)
+          [ "$count" -lt 100 ] && break
+        done
+
+        mapfile -t ak3 < <(grep -E '\-AnyKernel3$' "$names" | sort -u)
+        rm -f "$names"
+
+        if [[ "${#ak3[@]}" -eq 0 ]]; then
+          echo "ERROR: no *-AnyKernel3 artifacts in run ${SOURCE_RUN_ID}" >&2
+          exit 1
+        fi
+        echo "Found ${#ak3[@]} AnyKernel3 artifacts in run ${SOURCE_RUN_ID}"
+
+        # Fetch each artifact individually by name. actions/download-artifact's
+        # pattern match silently under-matched on a run this large (496 of 609
+        # on 36828639322) while still exiting 0, so per-name fetch is the only
+        # reliable path here. Sequential to stay under API rate limits.
+        failed=0
+        n=0
+        for name in "${ak3[@]}"; do
+          n=$((n + 1))
+          dest="release-assets/${name}"
+          [[ -d "$dest" ]] && continue
+          echo "[${n}/${#ak3[@]}] ${name}"
+          url=$(gh api "repos/${{ github.repository }}/actions/runs/${SOURCE_RUN_ID}/artifacts?name=${name}" \
+            --jq '.artifacts[0].archive_download_url // empty')
+          if [[ -z "$url" ]]; then
+            echo "  ERROR: no archive_download_url for ${name}" >&2
+            failed=$((failed + 1))
+            continue
+          fi
+          if ! curl -fsSL --retry 3 --retry-delay 2 -H "Authorization: Bearer ${GH_TOKEN}" \
+               -o /tmp/ak3.zip "$url"; then
+            echo "  ERROR: download failed for ${name}" >&2
+            failed=$((failed + 1))
+            continue
+          fi
+          mkdir -p "$dest"
+          if ! unzip -q -o /tmp/ak3.zip -d "$dest"; then
+            echo "  ERROR: unzip failed for ${name}" >&2
+            failed=$((failed + 1))
+            rm -rf "$dest"
+          fi
+        done
+        rm -f /tmp/ak3.zip
+
+        got=$(find release-assets -maxdepth 1 -type d -name '*-AnyKernel3' | wc -l)
+        echo "AnyKernel3 artifacts expected: ${#ak3[@]}, downloaded: ${got}, failed: ${failed}"
+        if [[ "$failed" -ne 0 || "$got" -ne "${#ak3[@]}" ]]; then
+          echo "ERROR: incomplete artifact set (${got}/${#ak3[@]}, ${failed} failed)" >&2
+          exit 1
+        fi
+
+    - name: Download manager APK zips from source run
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SOURCE_RUN_ID: ${{ steps.src.outputs.run_id }}
+      run: |
+        set -euo pipefail
+        mkdir -p release-assets
+
+        names=$(mktemp)
+        for page in $(seq 1 20); do
+          batch=$(gh api "repos/${{ github.repository }}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100&page=${page}" \
+            --jq '.artifacts[].name' || true)
+          [ -z "$batch" ] && break
+          printf '%s\n' "$batch" >> "$names"
+          count=$(grep -c . <<<"$batch" || true)
+          [ "$count" -lt 100 ] && break
+        done
+        mapfile -t apks < <(grep -E '\.apk$' "$names" | sort -u || true)
+        rm -f "$names"
+
+        echo "Found ${#apks[@]} *.apk artifacts"
+        for name in "${apks[@]}"; do
+          dest="release-assets/${name}"
+          [[ -d "$dest" ]] && continue
+          url=$(gh api "repos/${{ github.repository }}/actions/runs/${SOURCE_RUN_ID}/artifacts?name=${name}" \
+            --jq '.artifacts[0].archive_download_url // empty')
+          [[ -z "$url" ]] && { echo "  WARN: no url for ${name}"; continue; }
+          curl -fsSL --retry 3 --retry-delay 2 -H "Authorization: Bearer ${GH_TOKEN}" \
+            -o /tmp/apk.zip "$url" || { echo "  WARN: failed ${name}"; continue; }
+          mkdir -p "$dest" && unzip -q -o /tmp/apk.zip -d "$dest"
+        done
+        rm -f /tmp/apk.zip
+
+    - name: Download NoMount metamodule from source run
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SOURCE_RUN_ID: ${{ steps.src.outputs.run_id }}
+      run: |
+        set -euo pipefail
+        mkdir -p release-assets
+
+        names=$(mktemp)
+        for page in $(seq 1 20); do
+          batch=$(gh api "repos/${{ github.repository }}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100&page=${page}" \
+            --jq '.artifacts[].name' || true)
+          [ -z "$batch" ] && break
+          printf '%s\n' "$batch" >> "$names"
+          count=$(grep -c . <<<"$batch" || true)
+          [ "$count" -lt 100 ] && break
+        done
+        mapfile -t nm < <(grep -iE 'nomount.*metamodule' "$names" | sort -u || true)
+        rm -f "$names"
+
+        echo "Found ${#nm[@]} NoMount metamodule artifacts"
+        for name in "${nm[@]}"; do
+          dest="release-assets/${name}"
+          [[ -d "$dest" ]] && continue
+          url=$(gh api "repos/${{ github.repository }}/actions/runs/${SOURCE_RUN_ID}/artifacts?name=${name}" \
+            --jq '.artifacts[0].archive_download_url // empty')
+          [[ -z "$url" ]] && { echo "  WARN: no url for ${name}"; continue; }
+          curl -fsSL --retry 3 --retry-delay 2 -H "Authorization: Bearer ${GH_TOKEN}" \
+            -o /tmp/nm.zip "$url" || { echo "  WARN: failed ${name}"; continue; }
+          mkdir -p "$dest" && unzip -q -o /tmp/nm.zip -d "$dest"
+        done
+        rm -f /tmp/nm.zip
+
+    - name: Download release notes from source run
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SOURCE_RUN_ID: ${{ steps.src.outputs.run_id }}
+      run: |
+        set -euo pipefail
+        names=$(mktemp)
+        for page in $(seq 1 20); do
+          batch=$(gh api "repos/${{ github.repository }}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100&page=${page}" \
+            --jq '.artifacts[].name' || true)
+          [ -z "$batch" ] && break
+          printf '%s\n' "$batch" >> "$names"
+          count=$(grep -c . <<<"$batch" || true)
+          [ "$count" -lt 100 ] && break
+        done
+
+        if ! grep -qx 'release-notes-preview' "$names"; then
+          echo "ERROR: run ${SOURCE_RUN_ID} has no release-notes-preview artifact;" >&2
+          echo "       dispatch it with release_type=Pre-Release (or Release) so notes are rendered" >&2
+          exit 1
+        fi
+        rm -f "$names"
+
+        url=$(gh api "repos/${{ github.repository }}/actions/runs/${SOURCE_RUN_ID}/artifacts?name=release-notes-preview" \
+          --jq '.artifacts[0].archive_download_url // empty')
+        if [[ -z "$url" ]]; then
+          echo "ERROR: no archive_download_url for release-notes-preview" >&2
+          exit 1
+        fi
+        curl -fsSL --retry 3 --retry-delay 2 -H "Authorization: Bearer ${GH_TOKEN}" \
+          -o /tmp/notes.zip "$url"
+        unzip -q -o /tmp/notes.zip -d .
+        rm -f /tmp/notes.zip
+
+        if [[ ! -f release_body.md ]]; then
+          echo "ERROR: release_body.md not found in the notes artifact" >&2
+          exit 1
+        fi
+        echo "release_body.md: $(wc -l < release_body.md) lines"
+
+    - name: Generate tag
+      id: tag
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        mapfile -t RELEASE_TAGS < <(gh api --paginate "repos/${{ github.repository }}/tags?per_page=100" --jq '.[].name' 2>/dev/null | grep -E '^r[0-9]+$' || true)
+
+        LATEST_REV=0
+        for TAG in "${RELEASE_TAGS[@]}"; do
+          REV="${TAG#r}"
+          if [[ "$REV" =~ ^[0-9]+$ && "$REV" -gt "$LATEST_REV" ]]; then
+            LATEST_REV="$REV"
+          fi
+        done
+
+        if [[ "$LATEST_REV" -gt 0 ]]; then
+          NEW_TAG="r$((LATEST_REV + 1))"
+        else
+          NEW_TAG="r1"
+        fi
+
+        echo "New tag: $NEW_TAG"
+        echo "NEW_TAG=${NEW_TAG}" >> "$GITHUB_ENV"
+        echo "new_tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+
+    - name: Zip AnyKernel3 and NoMount for release
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+
+        for dir in release-assets/*-AnyKernel3; do
+          zip_name="${dir}.zip"
+          rm -f "$zip_name"
+          (
+            cd "$dir"
+            zip -r -q -9 "../$(basename "$zip_name")" .
+          )
+        done
+
+        for dir in release-assets/*NoMount*Metamodule* release-assets/*NoMount-Metamodule*; do
+          [[ -d "$dir" ]] || continue
+          zip_name="${dir}.zip"
+          rm -f "$zip_name"
+          (
+            cd "$dir"
+            zip -r -q -9 "../$(basename "$zip_name")" .
+          )
+        done
+
+        shopt -u nullglob
+        echo "zips: $(ls -1 release-assets/*.zip 2>/dev/null | wc -l)"
+
+    - name: Create Release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG_NAME: ${{ steps.tag.outputs.new_tag }}
+        SOURCE_RUN_ID: ${{ steps.src.outputs.run_id }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob globstar
+
+        files=(release-assets/**/*.zip release-assets/**/*.apk release-assets/**/*-boot*.img)
+        if [[ "${#files[@]}" -eq 0 ]]; then
+          echo "No release assets found" >&2
+          exit 1
+        fi
+        echo "Uploading ${#files[@]} assets from source run ${SOURCE_RUN_ID}"
+
+        rev="${TAG_NAME#r}"
+        release_title="Release ${rev}"
+
+        if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+          echo "Release $TAG_NAME already exists - refreshing notes."
+          gh release edit "$TAG_NAME" --notes-file release_body.md
+        elif [[ "${{ inputs.release_type }}" == "Pre-Release" ]]; then
+          gh release create "$TAG_NAME" --title "$release_title" --notes-file release_body.md --prerelease
+        else
+          gh release create "$TAG_NAME" --title "$release_title" --notes-file release_body.md
+        fi
+
+        uploaded=0
+        for f in "${files[@]}"; do
+          if gh release upload "$TAG_NAME" "$f" --clobber >/dev/null 2>&1; then
+            uploaded=$((uploaded + 1))
+          else
+            echo "WARN: failed to upload $f" >&2
+          fi
+        done
+        echo "Uploaded ${uploaded}/${#files[@]} assets to ${TAG_NAME}"
+        echo "Release: $(gh api "repos/${{ github.repository }}/releases/tags/${TAG_NAME}" --jq '.html_url')"

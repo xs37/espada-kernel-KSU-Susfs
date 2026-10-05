@@ -1,0 +1,152 @@
+name: Sync Kernel Matrix
+
+# Adds new upstream monthly branches to the build matrix via PR against
+# main. If a sync PR is already open, it is updated in place (the sync
+# branch is rebuilt from main each run, so PRs never stack). Dead/retired branches
+# need no action: download-kernel falls back to the latest release tag.
+#
+# NOTE: scheduled runs only fire from the default branch, so the cron
+# below stays dormant until this file exists on main. workflow_dispatch
+# works from any branch right away.
+
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  schedule:
+    - cron: '0 5 * * *'  # midnight EST (5am UTC)
+  workflow_dispatch:
+
+jobs:
+  sync-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Prepare sync branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main bot/sync-kernel-matrix || true
+          git checkout -B bot/sync-kernel-matrix origin/main
+
+      - name: Add new upstream months
+        id: sync
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import glob, json, os, re, shutil, subprocess, tempfile
+
+          COMMON_URL = "https://android.googlesource.com/kernel/common"
+          MONTH = re.compile(r"^(\d{4}-\d{2})$")
+          added = []
+
+          def ls_heads(pattern):
+              r = subprocess.run(
+                  ["git", "ls-remote", COMMON_URL, pattern],
+                  capture_output=True, text=True, timeout=120,
+              )
+              if r.returncode != 0:
+                  print(f"WARNING: ls-remote failed for {pattern}; skipping")
+                  return set()
+              return {line.split()[1] for line in r.stdout.splitlines() if line}
+
+          for path in sorted(glob.glob(".github/config/*.json")):
+              with open(path) as f:
+                  cfg = json.load(f)
+              version = cfg["version"]
+              have = {e["date"] for e in cfg["include"]}
+
+              live_refs = ls_heads(f"refs/heads/{version}-*")
+              live = set()
+              for ref in live_refs:
+                  m = re.search(rf"{re.escape(version)}-(\d{{4}}-\d{{2}})$", ref)
+                  if m:
+                      live.add(m.group(1))
+              if not live_refs:
+                  continue
+
+              dep_refs = ls_heads(f"refs/heads/deprecated/{version}-*")
+              deprecated = set()
+              for ref in dep_refs:
+                  m = re.search(rf"{re.escape(version)}-(\d{{4}}-\d{{2}})$", ref)
+                  if m:
+                      deprecated.add(m.group(1))
+
+              # Dead heads need no action (tag fallback covers them); just note them.
+              for date in sorted(have):
+                  if MONTH.match(date) and date not in live and date not in deprecated:
+                      print(f"NOTE: {version} {date}: head retired upstream, builds use latest tag")
+
+              version_added = False
+              for month in sorted(live - have):
+                  head = f"{version}-{month}"
+                  tmp = tempfile.mkdtemp(prefix="newk-")
+                  try:
+                      # --no-checkout, not --sparse: a sparse clone leaves the
+                      # working tree unpopulated, so reading Makefile off disk
+                      # raised FileNotFoundError while the clone itself exited 0.
+                      # Reading the blob straight from the object store avoids
+                      # the working tree entirely.
+                      subprocess.run(
+                          ["git", "clone", "--filter=blob:none", "--no-checkout",
+                           "--depth", "1", "--branch", head, COMMON_URL, tmp],
+                          check=True, capture_output=True, timeout=600,
+                      )
+                      sub = None
+                      r = subprocess.run(
+                          ["git", "-C", tmp, "show", "HEAD:Makefile"],
+                          check=True, capture_output=True, text=True, timeout=120,
+                      )
+                      for line in r.stdout.splitlines():
+                          if line.startswith("SUBLEVEL ="):
+                              sub = line.split("=", 1)[1].strip()
+                              break
+                      if sub is None:
+                          print(f"WARNING: no SUBLEVEL in {head}; skipping")
+                          continue
+                      cfg["include"].append({"sublevel": sub, "date": month})
+                      added.append(f"{version} {month} (sublevel {sub})")
+                      version_added = True
+                      print(f"ADD: {version} {month} (sublevel {sub})")
+                  except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                      print(f"WARNING: could not resolve {head} ({e}); skipping")
+                      continue
+                  finally:
+                      shutil.rmtree(tmp, ignore_errors=True)
+
+              if version_added:
+                  cfg["include"].sort(key=lambda e: e["date"])
+                  with open(path, "w") as f:
+                      json.dump(cfg, f, indent=2)
+                      f.write("\n")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"changed={'true' if added else 'false'}\n")
+              f.write(f"added={'; '.join(added)}\n")
+          EOF
+
+      - name: Open or update sync PR
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BRANCH="bot/sync-kernel-matrix"
+          git add .github/config/
+          git commit -m "Sync kernel matrix: add ${{ steps.sync.outputs.added }}"
+          git push --force-with-lease origin "$BRANCH" || git push origin "$BRANCH"
+          if [ "$(gh pr list --head "$BRANCH" --base main --json number --jq 'length')" = "0" ]; then
+            BODY=$(printf '%s' "${{ steps.sync.outputs.added }}" | sed 's/; /\n- /g; s/^/- /')
+            gh pr create --head "$BRANCH" --base main \
+              --title "Sync kernel matrix: add new upstream months" \
+              --body "$(printf 'New monthly branches detected upstream, sublevels resolved from source:\n\n%s\n\nDead/retired branches need no action (tag fallback covers them).' "$BODY")"
+          else
+            echo "Sync PR already open; updated in place."
+          fi
