@@ -8,6 +8,9 @@ inputs:
   kernel_version:
     description: 'Kernel version (e.g., 5.15, 6.1)'
     required: true
+  sublevel:
+    description: 'Selected kernel sublevel'
+    required: true
   version:
     description: 'Combined version (e.g., android14-6.1)'
     required: true
@@ -167,21 +170,34 @@ runs:
     #   run: |
     #     python "${{ github.workspace }}/.github/actions/download-kernel/fast_parallel_download.py"
 
+    - name: Use checked-out kernel source
+      shell: bash
+      run: |
+        set -euo pipefail
+        SOURCE_DIR="${{ github.workspace }}"
+        COMMON_DIR="${{ github.workspace }}/kernel/common"
+        test -f "$SOURCE_DIR/Makefile" || { echo "Kernel source Makefile not found in $SOURCE_DIR" >&2; exit 1; }
+        test -f "$COMMON_DIR/BUILD.bazel" || { echo "Kleaf common project not found in $COMMON_DIR" >&2; exit 1; }
+
+        SOURCE_VERSION="$(sed -n 's/^VERSION = //p' "$SOURCE_DIR/Makefile").$(sed -n 's/^PATCHLEVEL = //p' "$SOURCE_DIR/Makefile")"
+        SOURCE_SUBLEVEL="$(sed -n 's/^SUBLEVEL = //p' "$SOURCE_DIR/Makefile")"
+        if [[ "$SOURCE_VERSION" != "${{ inputs.kernel_version }}" || "$SOURCE_SUBLEVEL" != "${{ inputs.sublevel }}" ]]; then
+          echo "ERROR: checked-out source is $SOURCE_VERSION.$SOURCE_SUBLEVEL, but the selected build is ${{ inputs.kernel_version }}.${{ inputs.sublevel }}." >&2
+          exit 1
+        fi
+
+        find "$COMMON_DIR" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
+        git -C "$SOURCE_DIR" archive --format=tar HEAD | tar -xf - -C "$COMMON_DIR"
+        echo "Building checked-out source ${{ github.sha }} ($SOURCE_VERSION.$SOURCE_SUBLEVEL)."
+
     - name: Capture Kernel Common Commit Metadata
       shell: bash
-      working-directory: ${{ github.workspace }}/kernel
+      working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
 
-        if [[ ! -d common ]]; then
-          echo "WARNING: common folder not found; skipping commit metadata capture."
-          exit 0
-        fi
-
-        cd common
-
         if [[ ! -d .git ]]; then
-          echo "WARNING: common is not a git checkout; skipping commit metadata capture."
+          echo "WARNING: checked-out source has no git metadata; skipping commit metadata capture."
           exit 0
         fi
 
@@ -190,6 +206,6 @@ runs:
         COMMIT_SHA=$(git rev-parse HEAD)
 
         echo "KERNEL_SOURCE_COMMIT=$COMMIT_SHA" >> "$GITHUB_ENV"
-        echo "Kernel common commit date: $COMMIT_DATE"
-        echo "Kernel common commit msg: $COMMIT_MSG"
-        echo "Kernel common commit SHA: $COMMIT_SHA"
+        echo "Kernel source commit date: $COMMIT_DATE"
+        echo "Kernel source commit msg: $COMMIT_MSG"
+        echo "Kernel source commit SHA: $COMMIT_SHA"

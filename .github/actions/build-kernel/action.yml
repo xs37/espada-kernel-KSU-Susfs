@@ -83,6 +83,8 @@ runs:
           fi
           tools/bazel build \
             --config=fast \
+            --nouse_prebuilt_kernel \
+            --lto=none \
             "${PAGE_SIZE_FLAGS[@]}" \
             --disk_cache=/home/runner/.cache/bazel \
             //common:kernel_aarch64/Image

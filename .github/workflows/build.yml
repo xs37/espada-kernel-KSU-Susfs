@@ -158,6 +158,7 @@ jobs:
         version: ${{ inputs.version }}
         android_version: ${{ inputs.android_version }}
         kernel_version: ${{ inputs.kernel_version }}
+        sublevel: ${{ inputs.sublevel }}
         os_patch_level: ${{ inputs.os_patch_level }}
 
     - name: Set Build Timestamp from Kernel Commit

@@ -37,20 +37,13 @@ on:
         description: "Kernel Version"
         type: choice
         options:
-          - All
-          - 5.10.x-android12
-          - 5.10.x-android13
-          - 5.15.x-android13
-          - 5.15.x-android14
-          - 6.1.x-android14
-          - 6.6.x-android15
           - 6.12.x-android16
-        default: All
+        default: 6.12.x-android16
       os_patch_level:
         description: "Patch date (YYYY-MM), kernel sublevel, lts, or All (no filter)"
         required: true
         type: string
-        default: All
+        default: 2026-09
       page_size:
         description: "ARM64 page size. 16k requires explicitly selecting Kernel Version 6.1.x-android14, 6.6.x-android15 or 6.12.x-android16 (All is rejected)"
         type: choice
