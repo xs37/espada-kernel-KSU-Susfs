@@ -1,12 +1,12 @@
 name: Sync Kernel Matrix
 
-# Adds new upstream monthly branches to the build matrix via PR against
-# main. If a sync PR is already open, it is updated in place (the sync
-# branch is rebuilt from main each run, so PRs never stack). Dead/retired branches
+# Adds new upstream monthly branches to the Android 16 kernel matrix via PR
+# against espada. If a sync PR is already open, it is updated in place (the sync
+# branch is rebuilt from espada each run, so PRs never stack). Dead/retired branches
 # need no action: download-kernel falls back to the latest release tag.
 #
 # NOTE: scheduled runs only fire from the default branch, so the cron
-# below stays dormant until this file exists on main. workflow_dispatch
+# below stays dormant until this file exists on espada. workflow_dispatch
 # works from any branch right away.
 
 permissions:
@@ -22,10 +22,10 @@ jobs:
   sync-matrix:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout main
+      - name: Checkout espada
         uses: actions/checkout@v7
         with:
-          ref: main
+          ref: espada
           fetch-depth: 0
 
       - name: Prepare sync branch
@@ -33,8 +33,8 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin main bot/sync-kernel-matrix || true
-          git checkout -B bot/sync-kernel-matrix origin/main
+          git fetch origin espada bot/sync-kernel-matrix || true
+          git checkout -B bot/sync-kernel-matrix origin/espada
 
       - name: Add new upstream months
         id: sync
@@ -57,7 +57,7 @@ jobs:
                   return set()
               return {line.split()[1] for line in r.stdout.splitlines() if line}
 
-          for path in sorted(glob.glob(".github/config/*.json")):
+          for path in sorted(glob.glob(".github/config/android16-6.12.json")):
               with open(path) as f:
                   cfg = json.load(f)
               version = cfg["version"]
@@ -142,9 +142,9 @@ jobs:
           git add .github/config/
           git commit -m "Sync kernel matrix: add ${{ steps.sync.outputs.added }}"
           git push --force-with-lease origin "$BRANCH" || git push origin "$BRANCH"
-          if [ "$(gh pr list --head "$BRANCH" --base main --json number --jq 'length')" = "0" ]; then
+          if [ "$(gh pr list --head "$BRANCH" --base espada --json number --jq 'length')" = "0" ]; then
             BODY=$(printf '%s' "${{ steps.sync.outputs.added }}" | sed 's/; /\n- /g; s/^/- /')
-            gh pr create --head "$BRANCH" --base main \
+            gh pr create --head "$BRANCH" --base espada \
               --title "Sync kernel matrix: add new upstream months" \
               --body "$(printf 'New monthly branches detected upstream, sublevels resolved from source:\n\n%s\n\nDead/retired branches need no action (tag fallback covers them).' "$BODY")"
           else

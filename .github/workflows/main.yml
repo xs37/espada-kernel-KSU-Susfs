@@ -40,12 +40,14 @@ on:
           - 6.12.x-android16
         default: 6.12.x-android16
       os_patch_level:
-        description: "Patch date (YYYY-MM), kernel sublevel, lts, or All (no filter)"
+        description: "Espada kernel source patch level"
         required: true
-        type: string
+        type: choice
+        options:
+          - 2026-09
         default: 2026-09
       page_size:
-        description: "ARM64 page size. 16k requires explicitly selecting Kernel Version 6.1.x-android14, 6.6.x-android15 or 6.12.x-android16 (All is rejected)"
+        description: "ARM64 page size for this kernel"
         type: choice
         options:
           - 4k
@@ -82,10 +84,6 @@ on:
         default: All (KernelSU-Next + KernelSU + ReSukiSU)
       use_susfs:
         description: "SUSFS"
-        type: boolean
-        default: true
-      use_nomount:
-        description: "NoMount"
         type: boolean
         default: true
       use_bbg:
@@ -556,7 +554,6 @@ jobs:
 
           FEATURES=""
           [ "${{ inputs.use_susfs }}" = "true" ] && FEATURES="${FEATURES}SUSFS+"
-          [ "${{ inputs.use_nomount }}" = "true" ] && FEATURES="${FEATURES}NoMount+"
           [ "${{ inputs.use_bbg }}" = "true" ] && FEATURES="${FEATURES}BBG+"
           [ "${{ inputs.use_net }}" = "true" ] && FEATURES="${FEATURES}NET+"
           [ "${{ inputs.use_ds }}" = "true" ] && FEATURES="${FEATURES}DS+"
@@ -568,7 +565,7 @@ jobs:
           echo "feature_set=${FEATURES%+}" >> "$GITHUB_OUTPUT"
 
       - name: Clone shared source repos once
-        if: inputs.use_nomount && !inputs.test_release_notes
+        if: "github.event_name == 'workflow_dispatch' && !inputs.test_release_notes"
         shell: bash
         run: |
           set -euo pipefail
@@ -589,6 +586,8 @@ jobs:
       apk_list: ${{ steps.scan.outputs.apk_list }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: espada
 
       - name: Download and scan all manager APKs
         id: scan
@@ -705,6 +704,8 @@ jobs:
         item: ${{ fromJson(needs.list-manager-apks.outputs.apk_list) }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: espada
 
       - name: Download manager cross-blob
         uses: actions/download-artifact@v7
@@ -726,11 +727,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        if: inputs.use_nomount
+        with:
+          ref: espada
 
       - name: Clone NoMount source at pinned commit
         id: clone
-        if: inputs.use_nomount
         shell: bash
         run: |
           set -euo pipefail
@@ -743,14 +744,12 @@ jobs:
           echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
 
       - name: Build NoMount metamodule (nm only, no .ko)
-        if: inputs.use_nomount
         id: buildmod
         uses: ./.github/actions/nomount-metamodule
         with:
           commit: ${{ steps.clone.outputs.commit }}
 
       - name: Upload NoMount metamodule
-        if: inputs.use_nomount
         uses: actions/upload-artifact@v7
         with:
           name: NoMount-Metamodule
@@ -947,16 +946,17 @@ jobs:
       fail-fast: false
       matrix:
         root: ${{ fromJson(needs.resolve-sources.outputs.root_matrix) }}
+        mount_mode: [Mount, NoMount]
     uses: ./.github/workflows/prepare.yml
     with:
       config_file: .github/config/android16-6.12.json
-      feature_set: ${{ needs.resolve-sources.outputs.feature_set }}
+      feature_set: ${{ matrix.mount_mode == 'NoMount' && format('{0}+NoMount', needs.resolve-sources.outputs.feature_set) || needs.resolve-sources.outputs.feature_set }}
       susfs_commit: ${{ matrix.root.root_flavor == 'resukisu' && needs.resolve-sources.outputs.susfs_commit_android16_6_12_resukisu || (matrix.root.root_flavor == 'sukisu-ultra' && needs.resolve-sources.outputs.susfs_commit_android16_6_12_sukisu_ultra || needs.resolve-sources.outputs.susfs_commit_android16_6_12) }}
       nomount_commit: ${{ needs.resolve-sources.outputs.nomount_commit }}
       kernel_patches_commit: ${{ needs.resolve-sources.outputs.kernel_patches_commit }}
       root_flavor: ${{ matrix.root.root_flavor }}
       root_commit: ${{ matrix.root.root_commit }}
-      variant: ${{ matrix.root.variant }}
+      variant: ${{ format('{0}-{1}', matrix.root.variant, matrix.mount_mode) }}
       ksu_branch: ${{ needs.resolve-sources.outputs.kernelsu_commit }}
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
@@ -990,7 +990,7 @@ jobs:
     steps:
     - uses: actions/checkout@v7
       with:
-        ref: ${{ github.ref }}
+        ref: espada
         token: ${{ github.token }}
 
     - name: Promote verified pins on success
@@ -1005,7 +1005,7 @@ jobs:
         KERNELSU_SHA: ${{ needs.resolve-sources.outputs.ksu_commit }}
         RESUKISU_SHA: ${{ needs.resolve-sources.outputs.resukisu_commit }}
         SUKISU_ULTRA_SHA: ${{ needs.resolve-sources.outputs.sukisu_ultra_commit }}
-        APPROVE_NOMOUNT: ${{ inputs.use_nomount }}
+        APPROVE_NOMOUNT: true
         APPROVE_KERNELSU: ${{ (inputs.root_flavor == 'KernelSU' || startsWith(inputs.root_flavor, 'All')) }}
         APPROVE_RESUKISU: ${{ (inputs.root_flavor == 'ReSukiSU' || startsWith(inputs.root_flavor, 'All')) }}
         APPROVE_SUKISU_ULTRA: ${{ inputs.root_flavor == 'SukiSU-Ultra' }}
@@ -1500,13 +1500,11 @@ jobs:
         done
 
     - name: Verify NoMount metamodule zip
-      if: inputs.use_nomount
       run: |
         set -euo pipefail
-        # The metamodule silently missed r20 (artifact built fine, no zip
-        # on the release). Fail loud instead of shipping without it.
+        # Both kernel variants are published, so the NoMount metamodule is required.
         if ! ls release-assets/NoMount-Metamodule.zip >/dev/null 2>&1; then
-          echo "ERROR: use_nomount is true but release-assets/NoMount-Metamodule.zip is missing" >&2
+          echo "ERROR: NoMount-Metamodule.zip is missing" >&2
           ls release-assets/ >&2
           exit 1
         fi
@@ -1580,7 +1578,7 @@ jobs:
           MANAGER_LIST: ${{ needs.resolve-sources.outputs.manager_list }}
           ROOT_MATRIX: ${{ needs.resolve-sources.outputs.root_matrix }}
           USE_SUSFS: ${{ inputs.use_susfs }}
-          USE_NOMOUNT: ${{ inputs.use_nomount }}
+          USE_NOMOUNT: true
           USE_BBG: ${{ inputs.use_bbg }}
           USE_DS: ${{ inputs.use_ds }}
           USE_NET: ${{ inputs.use_net }}

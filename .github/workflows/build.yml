@@ -97,6 +97,8 @@ jobs:
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
+      with:
+        ref: espada
 
     - name: Validate Page Size
       shell: bash
