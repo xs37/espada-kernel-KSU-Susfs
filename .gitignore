@@ -11,6 +11,11 @@
 # Normal rules (sorted alphabetically)
 #
 .*
+!.github/
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/espada-build.yml
 *.a
 *.asn1.[ch]
 *.bc

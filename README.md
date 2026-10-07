@@ -20,9 +20,23 @@ Branch `espada` is the kernel. Flashable zips are posted in the XDA thread.
 
 ## Building
 
-Standard Bazel/Kleaf GKI build for the spacecraft target from source
-(`--nouse_prebuilt_kernel`, `--lto=none`). The device is 64-bit only; the kernel is
-flashed as a boot + vendor_kernel_boot pair and the two must always match.
+The GitHub Actions workflow builds the upstream [`espada` branch](https://github.com/atrejokm301/espada-kernel/tree/espada)
+using the Android 16 / Linux 6.12 Kleaf manifest, from source
+(`--nouse_prebuilt_kernel`, `--lto=none`). The device is 64-bit only.
+
+### GitHub Actions
+
+Run **Build Espada Kernel** from the Actions tab. Each run builds one selected root
+implementation and one selected mount option; it does not create a build matrix.
+The root choices are Espada's in-tree KernelSU, KernelSU-Next, or ReSukiSU.
+Mountify uses kernel OverlayFS support and must be installed separately. The NoMount
+option integrates NoMount and uploads its matching metamodule.
+
+The workflow builds the Kleaf distribution and does not create a device-specific
+flashable zip. The device needs matching `boot.img` and `vendor_kernel_boot.img`;
+do not flash an artifact unless both images are present and come from the same run.
+See the [build guide](docs/building.md), [feature options](docs/features.md), and
+[post-build notes](docs/post-install.md).
 
 ## License
 

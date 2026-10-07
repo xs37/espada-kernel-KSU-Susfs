@@ -1,0 +1,347 @@
+name: Build Espada Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      root_variant:
+        description: Root implementation (exactly one per run)
+        required: true
+        type: choice
+        options:
+          - KernelSU
+          - KernelSU-Next
+          - ReSukiSU
+        default: KernelSU
+      mount_backend:
+        description: NoMount integration or OverlayFS support for Mountify
+        required: true
+        type: choice
+        options:
+          - Mountify
+          - NoMount
+        default: Mountify
+
+permissions:
+  contents: read
+
+concurrency:
+  group: espada-kernel-build-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ inputs.root_variant }} / ${{ inputs.mount_backend }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      ROOT_VARIANT: ${{ inputs.root_variant }}
+      MOUNT_BACKEND: ${{ inputs.mount_backend }}
+    steps:
+      - name: Check out Espada source
+        uses: actions/checkout@v4
+        with:
+          repository: atrejokm301/espada-kernel
+          ref: espada
+          path: espada-source
+
+      - name: Free build space
+        uses: endersonmenezes/free-disk-space@v4
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages_one_command: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+          testing: false
+
+      - name: Set up Java for Bazel
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential curl flex git \
+            libelf-dev libncurses-dev libssl-dev python3 unzip zip zstd
+
+      - name: Install repo and Bazelisk
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p "$HOME/.local/bin"
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            --output "$HOME/.local/bin/repo"
+          chmod 0755 "$HOME/.local/bin/repo"
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://github.com/bazelbuild/bazelisk/releases/download/v1.26.0/bazelisk-linux-amd64 \
+            --output "$HOME/.local/bin/bazelisk"
+          chmod 0755 "$HOME/.local/bin/bazelisk"
+          ln -sf bazelisk "$HOME/.local/bin/bazel"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Sync Android 16 / Linux 6.12 Kleaf tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/kernel"
+          cd "$GITHUB_WORKSPACE/kernel"
+          repo init --depth=1 \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b common-android16-6.12
+          repo sync -c --no-clone-bundle -j2 --jobs-checkout=2
+
+      - name: Overlay the checked-out Espada kernel source
+        id: espada
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_DIR="$GITHUB_WORKSPACE/espada-source"
+          COMMON_DIR="$GITHUB_WORKSPACE/kernel/common"
+          test -f "$COMMON_DIR/BUILD.bazel" || {
+            echo "Android common kernel checkout is missing BUILD.bazel." >&2
+            exit 1
+          }
+          test -f "$SOURCE_DIR/Makefile" || {
+            echo "Espada kernel Makefile was not checked out." >&2
+            exit 1
+          }
+
+          VERSION="$(sed -n 's/^VERSION = //p' "$SOURCE_DIR/Makefile").$(sed -n 's/^PATCHLEVEL = //p' "$SOURCE_DIR/Makefile")"
+          if [ "$VERSION" != "6.12" ]; then
+            echo "Expected Espada Linux 6.12 source, found $VERSION." >&2
+            exit 1
+          fi
+
+          find "$COMMON_DIR" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
+          ESPADA_COMMIT="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+          git -C "$SOURCE_DIR" archive --format=tar "$ESPADA_COMMIT" | tar -xf - -C "$COMMON_DIR"
+          echo "commit=$ESPADA_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "ESPADA_COMMIT=$ESPADA_COMMIT" >> "$GITHUB_ENV"
+          echo "Espada source commit: $ESPADA_COMMIT"
+
+      - name: Select one root implementation
+        shell: bash
+        working-directory: ${{ github.workspace }}/kernel/common
+        run: |
+          set -euo pipefail
+          case "$ROOT_VARIANT" in
+            KernelSU)
+              ROOT_DIR="in-tree"
+              ROOT_SHA="$ESPADA_COMMIT"
+              test -f drivers/kernelsu/Kconfig || {
+                echo "Espada's in-tree KernelSU integration is missing." >&2
+                exit 1
+              }
+              ;;
+            KernelSU-Next)
+              ROOT_REPO="https://github.com/pershoot/KernelSU-Next.git"
+              ROOT_BRANCH="dev-susfs"
+              ROOT_DIR="KernelSU-Next"
+              ;;
+            ReSukiSU)
+              ROOT_REPO="https://github.com/ReSukiSU/ReSukiSU.git"
+              ROOT_BRANCH="main"
+              ROOT_DIR="ReSukiSU"
+              ;;
+            *)
+              echo "Unsupported root variant: $ROOT_VARIANT" >&2
+              exit 2
+              ;;
+          esac
+
+          if [ "$ROOT_VARIANT" != "KernelSU" ]; then
+            git clone --depth=1 --single-branch --branch "$ROOT_BRANCH" \
+              "$ROOT_REPO" "$ROOT_DIR"
+            test -f "$ROOT_DIR/kernel/Kconfig" && test -f "$ROOT_DIR/kernel/Makefile" || {
+              echo "$ROOT_VARIANT checkout has no kernel integration." >&2
+              exit 1
+            }
+            ROOT_SHA="$(git -C "$ROOT_DIR" rev-parse HEAD)"
+            mv drivers/kernelsu drivers/kernelsu-espada
+            ln -s "../$ROOT_DIR/kernel" drivers/kernelsu
+
+            if [ "$ROOT_VARIANT" = "KernelSU-Next" ] &&
+              grep -q 'KernelSU requires either CONFIG_KPROBES' drivers/kernelsu/Kbuild; then
+              sed -i 's/$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/$(warning "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/' \
+                drivers/kernelsu/Kbuild
+            fi
+            if [ "$ROOT_VARIANT" = "ReSukiSU" ] &&
+              grep -q 'You should use $(REPO_NAME) as a git submodule instead of copying code directly' drivers/kernelsu/Kbuild; then
+              sed -i 's/$(error You should use $(REPO_NAME) as a git submodule instead of copying code directly)/$(warning You should use $(REPO_NAME) as a git submodule instead of copying code directly)/' \
+                drivers/kernelsu/Kbuild
+            fi
+          fi
+
+          echo "ROOT_COMMIT=$ROOT_SHA" >> "$GITHUB_ENV"
+          echo "Selected $ROOT_VARIANT at $ROOT_SHA"
+
+      - name: Integrate NoMount when selected
+        if: inputs.mount_backend == 'NoMount'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          COMMON_DIR="$GITHUB_WORKSPACE/kernel/common"
+          cd "$COMMON_DIR"
+          NOMOUNT_REPO="https://github.com/maxsteeel/nomount.git"
+          NOMOUNT_SHA="$(git ls-remote "$NOMOUNT_REPO" refs/heads/dev | awk 'NR == 1 { print $1 }')"
+          if ! [[ "$NOMOUNT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not resolve the NoMount dev branch to a full commit." >&2
+            exit 1
+          fi
+
+          git clone --no-checkout "$NOMOUNT_REPO" NoMount
+          git -C NoMount fetch --depth=1 origin "$NOMOUNT_SHA"
+          git -C NoMount checkout --detach --quiet "$NOMOUNT_SHA"
+          SETUP_SCRIPT="$RUNNER_TEMP/nomount-setup-${NOMOUNT_SHA}.sh"
+          curl --fail --location --retry 5 --retry-all-errors \
+            "https://raw.githubusercontent.com/maxsteeel/nomount/${NOMOUNT_SHA}/kernel/setup.sh" \
+            --output "$SETUP_SCRIPT"
+          chmod 0755 "$SETUP_SCRIPT"
+          "$SETUP_SCRIPT" "$NOMOUNT_SHA"
+          test -L "$COMMON_DIR/fs/nomount" || {
+            echo "NoMount integration did not create fs/nomount." >&2
+            exit 1
+          }
+
+          echo "NOMOUNT_COMMIT=$NOMOUNT_SHA" >> "$GITHUB_ENV"
+          echo "Integrated NoMount at $NOMOUNT_SHA"
+
+      - name: Configure root and mount support
+        shell: bash
+        working-directory: ${{ github.workspace }}/kernel/common
+        run: |
+          set -euo pipefail
+          CONFIG="arch/arm64/configs/gki_defconfig"
+          scripts/config --file "$CONFIG" \
+            --enable KSU \
+            --enable KSU_SUSFS \
+            --enable OVERLAY_FS \
+            --enable TMPFS_XATTR \
+            --enable TMPFS_POSIX_ACL
+          if [ "$ROOT_VARIANT" = "ReSukiSU" ]; then
+            scripts/config --file "$CONFIG" \
+              --disable KSU_MULTI_MANAGER_SUPPORT \
+              --enable KSU_TOOLKIT_SUPPORT
+          fi
+          if [ "$MOUNT_BACKEND" = "NoMount" ]; then
+            scripts/config --file "$CONFIG" --enable NOMOUNT
+          fi
+
+          # The Espada root and mount options intentionally extend GKI's
+          # defconfig, so do not reject them as upstream defconfig drift.
+          sed -i '/name = "kernel_aarch64",/a\    check_defconfig = "disabled",' BUILD.bazel
+
+      - name: Build the Espada GKI distribution
+        shell: bash
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -euo pipefail
+          DIST_DIR="$GITHUB_WORKSPACE/out/dist"
+          mkdir -p "$DIST_DIR"
+          echo "Building Espada commit $ESPADA_COMMIT ($ROOT_VARIANT, $MOUNT_BACKEND)"
+          tools/bazel run \
+            --nouse_prebuilt_kernel \
+            --lto=none \
+            //common:kernel_aarch64_dist \
+            -- --destdir="$DIST_DIR"
+
+          test -s "$DIST_DIR/Image" || {
+            echo "Kleaf completed without producing dist/Image." >&2
+            exit 1
+          }
+          CONFIG_FILE="bazel-bin/common/kernel_aarch64_config/out_dir/.config"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            CONFIG_FILE="$(find bazel-bin/common -maxdepth 5 -type f -name .config -print -quit)"
+          fi
+          if [ -z "$CONFIG_FILE" ] || [ ! -f "$CONFIG_FILE" ]; then
+            echo "Could not locate the generated kernel .config." >&2
+            exit 1
+          fi
+          for option in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_OVERLAY_FS; do
+            if ! grep -qx "${option}=y" "$CONFIG_FILE"; then
+              echo "Expected ${option}=y in $CONFIG_FILE." >&2
+              exit 1
+            fi
+          done
+          if [ "$MOUNT_BACKEND" = "NoMount" ] && ! grep -qx 'CONFIG_NOMOUNT=y' "$CONFIG_FILE"; then
+            echo "NoMount was selected but CONFIG_NOMOUNT is not enabled." >&2
+            exit 1
+          fi
+          printf 'Espada source: %s\nRoot variant: %s\nRoot commit: %s\nMount backend: %s\nNoMount commit: %s\n' \
+            "$ESPADA_COMMIT" "$ROOT_VARIANT" "$ROOT_COMMIT" "$MOUNT_BACKEND" "${NOMOUNT_COMMIT:-not used}" \
+            > "$DIST_DIR/BUILD_INFO.txt"
+          (
+            cd "$DIST_DIR"
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 |
+              sort -z | xargs -0 -r sha256sum > SHA256SUMS
+          )
+          echo "Kleaf dist contents:"
+          find "$DIST_DIR" -maxdepth 1 -type f -printf '%f\n' | sort
+          if [ ! -s "$DIST_DIR/boot.img" ] || [ ! -s "$DIST_DIR/vendor_kernel_boot.img" ]; then
+            echo "::warning::The Kleaf dist does not contain both boot.img and vendor_kernel_boot.img; do not flash an incomplete pair."
+          fi
+
+      - name: Build the matching NoMount metamodule
+        if: inputs.mount_backend == 'NoMount'
+        shell: bash
+        working-directory: ${{ github.workspace }}/kernel/common/NoMount
+        run: |
+          set -euo pipefail
+          ZIG_VERSION="0.13.0"
+          ZIG_DIR="$RUNNER_TEMP/zig-${ZIG_VERSION}"
+          curl --fail --location --retry 5 --retry-all-errors \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+            --output "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$ZIG_DIR"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" --strip-components=1 -C "$ZIG_DIR"
+
+          MODULE_DIR="$GITHUB_WORKSPACE/out/nomount-metamodule"
+          cp -a module "$MODULE_DIR"
+          mkdir -p "$MODULE_DIR/bin"
+          (
+            cd userspace/src
+            "$ZIG_DIR/zig" cc -target aarch64-linux -Oz -mcmodel=tiny -static \
+              -nostdlib -ffreestanding -fno-unwind-tables -fno-ident \
+              -Wno-invalid-noreturn -Wl,--entry=_start nm.c \
+              -o "$MODULE_DIR/bin/nm-arm64"
+            "$ZIG_DIR/zig" cc -target arm-linux -Oz -static -nostdlib \
+              -ffreestanding -fno-unwind-tables -fno-ident \
+              -Wno-invalid-noreturn -ffunction-sections -fdata-sections \
+              -Wl,--gc-sections -Wl,--entry=_start nm.c \
+              -o "$MODULE_DIR/bin/nm-arm"
+          )
+          sed -i 's/^versionCode=.*/versionCode=1/' "$MODULE_DIR/module.prop"
+          printf '%s\n' "$NOMOUNT_COMMIT" > "$MODULE_DIR/NOMOUNT_SOURCE_COMMIT"
+          (
+            cd "$MODULE_DIR"
+            zip -qr "$GITHUB_WORKSPACE/out/NoMount-${NOMOUNT_COMMIT}.zip" .
+          )
+          sha256sum "$GITHUB_WORKSPACE/out/NoMount-${NOMOUNT_COMMIT}.zip" \
+            > "$GITHUB_WORKSPACE/out/NoMount-${NOMOUNT_COMMIT}.zip.sha256"
+
+      - name: Upload kernel distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: Espada-${{ inputs.root_variant }}-${{ inputs.mount_backend }}-${{ steps.espada.outputs.commit }}
+          path: out/dist/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload NoMount metamodule
+        if: inputs.mount_backend == 'NoMount'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NoMount-${{ env.NOMOUNT_COMMIT }}
+          path: out/NoMount-${{ env.NOMOUNT_COMMIT }}.zip*
+          if-no-files-found: error
+          compression-level: 0
