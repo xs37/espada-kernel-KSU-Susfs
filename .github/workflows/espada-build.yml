@@ -250,7 +250,6 @@ jobs:
           mkdir -p "$DIST_DIR"
           echo "Building Espada commit $ESPADA_COMMIT ($ROOT_VARIANT, $MOUNT_BACKEND)"
           tools/bazel run \
-            --nouse_prebuilt_kernel \
             --lto=none \
             //common:kernel_aarch64_dist \
             -- --destdir="$DIST_DIR"
